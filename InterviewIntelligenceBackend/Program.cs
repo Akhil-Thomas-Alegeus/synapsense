@@ -8,6 +8,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Configuration;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
+using Microsoft.Azure.Cosmos;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -29,6 +30,20 @@ if (!string.IsNullOrEmpty(storageConnectionString))
     blobContainerClient = blobServiceClient.GetBlobContainerClient(containerName);
     // Create container if it doesn't exist
     blobContainerClient.CreateIfNotExists(PublicAccessType.None);
+}
+
+// Azure Cosmos DB client for Job Descriptions
+var cosmosConnectionString = builder.Configuration["Azure:CosmosDB:ConnectionString"];
+var cosmosDatabaseName = builder.Configuration["Azure:CosmosDB:DatabaseName"] ?? "interviewdb";
+var cosmosContainerName = builder.Configuration["Azure:CosmosDB:ContainerName"] ?? "interviewdb";
+CosmosClient? cosmosClient = null;
+Container? cosmosContainer = null;
+
+if (!string.IsNullOrEmpty(cosmosConnectionString))
+{
+    cosmosClient = new CosmosClient(cosmosConnectionString);
+    var database = cosmosClient.GetDatabase(cosmosDatabaseName);
+    cosmosContainer = database.GetContainer(cosmosContainerName);
 }
 
 // Register HttpClient factory
@@ -1388,6 +1403,184 @@ app.MapGet("/api/admin/interviews/{sessionId}/combined-analysis", (string sessio
     Description = "Returns the combined transcript and video analysis results"
 });
 
+// ========== JOB DESCRIPTION ENDPOINTS ==========
+
+// Create a new job description
+app.MapPost("/api/job-descriptions", async (JobDescription jobDescription) =>
+{
+    if (cosmosContainer == null)
+    {
+        return Results.Problem("Cosmos DB is not configured");
+    }
+
+    try
+    {
+        // Generate ID if not provided
+        if (string.IsNullOrEmpty(jobDescription.id))
+        {
+            jobDescription.id = "jd_" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + "_" + Guid.NewGuid().ToString("N")[..9];
+        }
+        
+        // Set timestamps if not provided
+        if (string.IsNullOrEmpty(jobDescription.createdAt))
+        {
+            jobDescription.createdAt = DateTime.UtcNow.ToString("o");
+        }
+        jobDescription.updatedAt = DateTime.UtcNow.ToString("o");
+
+        // Use id as partition key (matching existing data structure)
+        var response = await cosmosContainer.CreateItemAsync(jobDescription, new PartitionKey(jobDescription.id));
+        return Results.Created($"/api/job-descriptions/{jobDescription.id}", response.Resource);
+    }
+    catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Conflict)
+    {
+        return Results.Conflict(new { error = "Job description with this ID already exists" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to create job description: {ex.Message}");
+    }
+})
+.WithName("CreateJobDescription")
+.WithTags("Job Descriptions")
+.WithOpenApi(operation => new(operation)
+{
+    Summary = "Create a new job description",
+    Description = "Creates a new job description in Cosmos DB"
+});
+
+// Get all job descriptions
+app.MapGet("/api/job-descriptions", async () =>
+{
+    if (cosmosContainer == null)
+    {
+        return Results.Problem("Cosmos DB is not configured");
+    }
+
+    try
+    {
+        // Query all job descriptions (items with jobTitle field)
+        var query = new QueryDefinition("SELECT * FROM c WHERE IS_DEFINED(c.jobTitle) ORDER BY c.createdAt DESC");
+        var iterator = cosmosContainer.GetItemQueryIterator<JobDescription>(query);
+        var results = new List<JobDescription>();
+
+        while (iterator.HasMoreResults)
+        {
+            var response = await iterator.ReadNextAsync();
+            results.AddRange(response);
+        }
+
+        return Results.Ok(results);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to retrieve job descriptions: {ex.Message}");
+    }
+})
+.WithName("GetJobDescriptions")
+.WithTags("Job Descriptions")
+.WithOpenApi(operation => new(operation)
+{
+    Summary = "Get all job descriptions",
+    Description = "Returns all job descriptions from Cosmos DB"
+});
+
+// Get a specific job description by ID
+app.MapGet("/api/job-descriptions/{id}", async (string id) =>
+{
+    if (cosmosContainer == null)
+    {
+        return Results.Problem("Cosmos DB is not configured");
+    }
+
+    try
+    {
+        // Use id as partition key since that's how the container is configured
+        var response = await cosmosContainer.ReadItemAsync<JobDescription>(id, new PartitionKey(id));
+        return Results.Ok(response.Resource);
+    }
+    catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return Results.NotFound(new { error = "Job description not found" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to retrieve job description: {ex.Message}");
+    }
+})
+.WithName("GetJobDescription")
+.WithTags("Job Descriptions")
+.WithOpenApi(operation => new(operation)
+{
+    Summary = "Get a job description by ID",
+    Description = "Returns a specific job description from Cosmos DB"
+});
+
+// Update a job description
+app.MapPut("/api/job-descriptions/{id}", async (string id, JobDescription jobDescription) =>
+{
+    if (cosmosContainer == null)
+    {
+        return Results.Problem("Cosmos DB is not configured");
+    }
+
+    try
+    {
+        jobDescription.id = id;
+        jobDescription.updatedAt = DateTime.UtcNow.ToString("o");
+
+        // Use id as partition key
+        var response = await cosmosContainer.ReplaceItemAsync(jobDescription, id, new PartitionKey(id));
+        return Results.Ok(response.Resource);
+    }
+    catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return Results.NotFound(new { error = "Job description not found" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to update job description: {ex.Message}");
+    }
+})
+.WithName("UpdateJobDescription")
+.WithTags("Job Descriptions")
+.WithOpenApi(operation => new(operation)
+{
+    Summary = "Update a job description",
+    Description = "Updates an existing job description in Cosmos DB"
+});
+
+// Delete a job description
+app.MapDelete("/api/job-descriptions/{id}", async (string id) =>
+{
+    if (cosmosContainer == null)
+    {
+        return Results.Problem("Cosmos DB is not configured");
+    }
+
+    try
+    {
+        // Use id as partition key
+        await cosmosContainer.DeleteItemAsync<JobDescription>(id, new PartitionKey(id));
+        return Results.Ok(new { message = "Job description deleted successfully" });
+    }
+    catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return Results.NotFound(new { error = "Job description not found" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to delete job description: {ex.Message}");
+    }
+})
+.WithName("DeleteJobDescription")
+.WithTags("Job Descriptions")
+.WithOpenApi(operation => new(operation)
+{
+    Summary = "Delete a job description",
+    Description = "Deletes a job description from Cosmos DB"
+});
+
 app.Run();
 
 // ---------- Helper Functions ----------
@@ -1869,4 +2062,25 @@ public class CombinedAnalysisResult
 
 public record AnalyzeInterviewRequest(string sessionId);
 public record SaveTranscriptRequest(string sessionId, string question, string answer, double responseTimeSeconds);
+
+// ========== JOB DESCRIPTION MODEL ==========
+
+public class JobDescription
+{
+    public string id { get; set; } = string.Empty;
+    public string jobTitle { get; set; } = string.Empty;
+    public string department { get; set; } = string.Empty;
+    public string experienceLevel { get; set; } = string.Empty;
+    public string employmentType { get; set; } = string.Empty;
+    public string description { get; set; } = string.Empty;
+    public string responsibilities { get; set; } = string.Empty;
+    public List<string> requiredSkills { get; set; } = new();
+    public List<string> niceToHaveSkills { get; set; } = new();
+    public string qualifications { get; set; } = string.Empty;
+    public string interviewTopics { get; set; } = string.Empty;
+    public string evaluationCriteria { get; set; } = string.Empty;
+    public string createdAt { get; set; } = string.Empty;
+    public string updatedAt { get; set; } = string.Empty;
+    public string createdBy { get; set; } = string.Empty;
+}
 
