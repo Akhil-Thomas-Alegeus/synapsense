@@ -330,6 +330,7 @@ app.MapPost("/api/interview/start", async (HttpContext http) =>
         session.CandidateEmail = invite.CandidateEmail;
         session.Position = invite.Position;
         session.JobDescriptionId = invite.JobDescriptionId;
+        session.ResumeId = invite.ResumeId; // Copy resume reference
         
         invite.IsUsed = true;
         invite.UsedAt = DateTime.UtcNow;
@@ -429,7 +430,7 @@ app.MapGet("/api/speech/token", async (HttpContext http, IHttpClientFactory http
     Description = "Retrieves an authentication token for Azure Speech Service"
 });
 
-// 2) Generate follow-up question (using Azure OpenAI)
+// 2) Generate follow-up question (using Azure OpenAI with JD and Resume context)
 app.MapPost("/api/generate-question", async (GenerateQuestionRequest req, HttpContext http, IHttpClientFactory httpClientFactory, IConfiguration config) =>
 {
     if (string.IsNullOrWhiteSpace(req.text))
@@ -441,6 +442,9 @@ app.MapPost("/api/generate-question", async (GenerateQuestionRequest req, HttpCo
 
     // Check session limits if sessionId is provided
     InterviewSession? session = null;
+    JobDescription? jobDescription = null;
+    CandidateResume? candidateResume = null;
+    
     if (!string.IsNullOrWhiteSpace(req.sessionId))
     {
         if (interviewSessions.TryGetValue(req.sessionId, out session))
@@ -459,10 +463,32 @@ app.MapPost("/api/generate-question", async (GenerateQuestionRequest req, HttpCo
                 // Persist session changes to Cosmos DB
                 await SaveSessionToCosmosAsync(session);
                 
-                var thankYouMessage = $"Thank you so much for taking the time to speak with me today! I really enjoyed our conversation and learning about your experience with .NET development. {(session.QuestionCount >= MaxQuestions ? "We've covered everything I wanted to discuss" : "We've reached the end of our scheduled time")}. Our team will review everything and be in touch soon. Do you have any questions for me about the role or the team before we wrap up?";
+                var thankYouMessage = $"Thank you so much for taking the time to speak with me today! I really enjoyed our conversation and learning about your experience. {(session.QuestionCount >= MaxQuestions ? "We've covered everything I wanted to discuss" : "We've reached the end of our scheduled time")}. Our team will review everything and be in touch soon. Do you have any questions for me about the role or the team before we wrap up?";
                 
                 await http.Response.WriteAsJsonAsync(new GenerateQuestionResponse(thankYouMessage, true, session.QuestionCount, elapsedMinutes));
                 return;
+            }
+            
+            // Fetch Job Description from Cosmos DB if available
+            if (!string.IsNullOrEmpty(session.JobDescriptionId) && cosmosContainer != null)
+            {
+                try
+                {
+                    var jdResponse = await cosmosContainer.ReadItemAsync<JobDescription>(session.JobDescriptionId, new PartitionKey(session.JobDescriptionId));
+                    jobDescription = jdResponse.Resource;
+                }
+                catch { /* JD not found, continue without it */ }
+            }
+            
+            // Fetch Resume from Cosmos DB if available
+            if (!string.IsNullOrEmpty(session.ResumeId) && cosmosContainer != null)
+            {
+                try
+                {
+                    var resumeResponse = await cosmosContainer.ReadItemAsync<CandidateResume>(session.ResumeId, new PartitionKey(session.ResumeId));
+                    candidateResume = resumeResponse.Resource;
+                }
+                catch { /* Resume not found, continue without it */ }
             }
         }
     }
@@ -480,7 +506,92 @@ app.MapPost("/api/generate-question", async (GenerateQuestionRequest req, HttpCo
         return;
     }
 
-    var systemPrompt = @"You are a friendly and professional technical interviewer conducting an interview for a .NET developer position.
+    // Build dynamic system prompt based on JD and Resume
+    var systemPromptBuilder = new StringBuilder();
+    systemPromptBuilder.AppendLine("You are a friendly and professional technical interviewer.");
+    
+    // Add position context
+    if (jobDescription != null)
+    {
+        systemPromptBuilder.AppendLine($"\n=== JOB POSITION: {jobDescription.jobTitle} ===");
+        systemPromptBuilder.AppendLine($"Department: {jobDescription.department}");
+        systemPromptBuilder.AppendLine($"Experience Level: {jobDescription.experienceLevel}");
+        
+        if (jobDescription.requiredSkills?.Any() == true)
+        {
+            systemPromptBuilder.AppendLine($"Required Skills: {string.Join(", ", jobDescription.requiredSkills)}");
+        }
+        
+        if (!string.IsNullOrEmpty(jobDescription.interviewTopics))
+        {
+            systemPromptBuilder.AppendLine($"Interview Topics to Cover: {jobDescription.interviewTopics}");
+        }
+        
+        if (!string.IsNullOrEmpty(jobDescription.evaluationCriteria))
+        {
+            systemPromptBuilder.AppendLine($"Evaluation Criteria: {jobDescription.evaluationCriteria}");
+        }
+    }
+    else if (session?.Position != null)
+    {
+        systemPromptBuilder.AppendLine($"\nYou are interviewing for a {session.Position} position.");
+    }
+    
+    // Add candidate context from resume
+    if (candidateResume != null)
+    {
+        systemPromptBuilder.AppendLine($"\n=== CANDIDATE: {candidateResume.candidateName} ===");
+        
+        if (!string.IsNullOrEmpty(candidateResume.currentRole))
+        {
+            systemPromptBuilder.AppendLine($"Current Role: {candidateResume.currentRole}");
+        }
+        
+        if (candidateResume.yearsOfExperience.HasValue)
+        {
+            systemPromptBuilder.AppendLine($"Years of Experience: {candidateResume.yearsOfExperience}");
+        }
+        
+        if (candidateResume.technicalSkills?.Any() == true)
+        {
+            systemPromptBuilder.AppendLine($"Technical Skills: {string.Join(", ", candidateResume.technicalSkills.Take(10))}");
+        }
+        
+        if (candidateResume.programmingLanguages?.Any() == true)
+        {
+            systemPromptBuilder.AppendLine($"Programming Languages: {string.Join(", ", candidateResume.programmingLanguages)}");
+        }
+        
+        if (candidateResume.frameworks?.Any() == true)
+        {
+            systemPromptBuilder.AppendLine($"Frameworks: {string.Join(", ", candidateResume.frameworks)}");
+        }
+        
+        if (candidateResume.workExperience?.Any() == true)
+        {
+            systemPromptBuilder.AppendLine("\nRecent Work Experience:");
+            foreach (var exp in candidateResume.workExperience.Take(2))
+            {
+                systemPromptBuilder.AppendLine($"  - {exp.title} at {exp.company} ({exp.duration})");
+                if (exp.highlights?.Any() == true)
+                {
+                    systemPromptBuilder.AppendLine($"    Key work: {string.Join("; ", exp.highlights.Take(2))}");
+                }
+            }
+        }
+        
+        if (candidateResume.suggestedInterviewTopics?.Any() == true)
+        {
+            systemPromptBuilder.AppendLine($"\nSuggested Topics to Explore: {string.Join(", ", candidateResume.suggestedInterviewTopics)}");
+        }
+        
+        if (candidateResume.areasToProbe?.Any() == true)
+        {
+            systemPromptBuilder.AppendLine($"Areas to Probe: {string.Join(", ", candidateResume.areasToProbe)}");
+        }
+    }
+    
+    systemPromptBuilder.AppendLine(@"
 
 TONE & STYLE:
 - Be warm, encouraging, and professionally friendly
@@ -488,20 +599,58 @@ TONE & STYLE:
 - Then ask your follow-up question
 - Keep your total response concise (2-3 sentences max)
 
-TOPIC GUIDELINES:
-- Focus on .NET technologies (C#, ASP.NET, .NET Core, Entity Framework, LINQ, etc.)
-- You may also discuss general software development practices, problem-solving, and teamwork
+INTERVIEW STRATEGY:");
+    
+    if (jobDescription != null && candidateResume != null)
+    {
+        systemPromptBuilder.AppendLine(@"- Use the JOB REQUIREMENTS to focus on skills that matter for this role
+- Use the CANDIDATE'S RESUME to ask SPECIFIC questions about their past projects and experience
+- For example, if they worked at Company X, ask about specific challenges or achievements there
+- If they list a technology, ask how they've used it in production
+- Probe gaps between their experience and job requirements");
+    }
+    else if (candidateResume != null)
+    {
+        systemPromptBuilder.AppendLine(@"- Use the CANDIDATE'S RESUME to ask SPECIFIC questions about their experience
+- Reference their actual companies, projects, and technologies
+- Ask about specific achievements mentioned in their resume");
+    }
+    else
+    {
+        systemPromptBuilder.AppendLine(@"- Focus on general software development practices and problem-solving
+- Ask about their experience with relevant technologies");
+    }
+    
+    systemPromptBuilder.AppendLine(@"
 - Stay within the context of the current interview conversation
 - If the candidate goes off-topic, gently and kindly redirect back to relevant topics
 
 EXAMPLE FORMAT:
-'That's a great point about [topic]! [Follow-up question about .NET or the interview context]'
+'That's a great point about [topic]! [Follow-up question specific to their experience or the job requirements]'
 or
-'I appreciate you sharing that experience. [Follow-up question]'";
+'I appreciate you sharing that experience. [Question about a specific project or skill from their resume]'");
 
-    var userPrompt = $@"Given the candidate's last answer, provide a brief positive acknowledgment followed by a relevant follow-up question.
-Candidate answer: ""{req.text}""
-Remember: Start with short feedback (1 sentence), then ask your question. Be warm and professional.";
+    var systemPrompt = systemPromptBuilder.ToString();
+
+    // Build user prompt with conversation history for context
+    var userPromptBuilder = new StringBuilder();
+    userPromptBuilder.AppendLine("Given the candidate's last answer, provide a brief positive acknowledgment followed by a relevant follow-up question.");
+    
+    // Add recent conversation history for context
+    if (session?.Transcript?.Any() == true)
+    {
+        userPromptBuilder.AppendLine("\nRecent conversation:");
+        foreach (var exchange in session.Transcript.TakeLast(3))
+        {
+            userPromptBuilder.AppendLine($"Q: {exchange.Question}");
+            userPromptBuilder.AppendLine($"A: {exchange.Answer}");
+        }
+    }
+    
+    userPromptBuilder.AppendLine($"\nCandidate's latest answer: \"{req.text}\"");
+    userPromptBuilder.AppendLine("\nRemember: Start with short feedback (1 sentence), then ask your question. Be warm and professional. Ask something SPECIFIC based on their resume or the job requirements if available.");
+
+    var userPrompt = userPromptBuilder.ToString();
 
     var aoUrl = $"{aoEndpoint}/openai/deployments/{deploymentId}/chat/completions?api-version=2023-10-01-preview";
 
@@ -513,7 +662,7 @@ Remember: Start with short feedback (1 sentence), then ask your question. Be war
             new { role = "system", content = systemPrompt },
             new { role = "user", content = userPrompt }
         },
-        max_tokens = 100,
+        max_tokens = 150, // Increased for more detailed personalized questions
         temperature = 0.7
     };
 
@@ -2720,6 +2869,7 @@ public class InterviewSession
     public string? CandidateEmail { get; set; }
     public string? Position { get; set; }
     public string? JobDescriptionId { get; set; }
+    public string? ResumeId { get; set; } // Reference to parsed resume in Cosmos DB
     public string? InviteCode { get; set; } // Links back to invite
     public InterviewAnalysis? Analysis { get; set; }
     public VideoAnalysisResult? VideoAnalysis { get; set; } // Video behavioral analysis
