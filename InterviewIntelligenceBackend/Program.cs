@@ -1759,12 +1759,29 @@ app.MapGet("/api/admin/interviews", () =>
 });
 
 // Get detailed interview with analysis
-app.MapGet("/api/admin/interviews/{sessionId}", (string sessionId) =>
+app.MapGet("/api/admin/interviews/{sessionId}", async (string sessionId) =>
 {
     InterviewSession? session = null;
     
-    if (completedInterviews.TryGetValue(sessionId, out session) || 
-        interviewSessions.TryGetValue(sessionId, out session))
+    // Check in-memory first, then Cosmos DB
+    if (!completedInterviews.TryGetValue(sessionId, out session))
+    {
+        if (!interviewSessions.TryGetValue(sessionId, out session))
+        {
+            // Try Cosmos DB
+            if (cosmosContainer != null)
+            {
+                try
+                {
+                    var response = await cosmosContainer.ReadItemAsync<InterviewSession>(sessionId, new PartitionKey(sessionId));
+                    session = response.Resource;
+                }
+                catch { /* Not found */ }
+            }
+        }
+    }
+    
+    if (session != null)
     {
         return Results.Ok(new
         {
