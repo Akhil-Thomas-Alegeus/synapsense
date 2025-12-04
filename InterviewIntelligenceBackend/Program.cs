@@ -86,6 +86,17 @@ app.UseCors();
 
 // ---------- Endpoints ----------
 
+// Health check endpoint
+app.MapGet("/api/health", () => Results.Ok(new
+{
+    status = "healthy",
+    timestamp = DateTime.UtcNow,
+    service = "Interview Intelligence Backend"
+}))
+.WithName("HealthCheck")
+.WithTags("Health")
+.WithOpenApi();
+
 // Start a new interview session (with optional invite code)
 app.MapPost("/api/interview/start", async (HttpContext http) =>
 {
