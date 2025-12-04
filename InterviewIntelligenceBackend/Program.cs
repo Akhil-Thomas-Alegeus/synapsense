@@ -1028,6 +1028,190 @@ Analyze this interview and provide your assessment as JSON.";
                 AnalyzedAt = DateTime.UtcNow
             };
             
+            // ===== JD FIT ANALYSIS =====
+            // Fetch the JD the candidate interviewed for and all other JDs
+            JobDescription? interviewedJD = null;
+            CandidateResume? candidateResume = null;
+            var allJobDescriptions = new List<JobDescription>();
+            
+            if (cosmosContainer != null)
+            {
+                // Fetch the JD for this interview
+                if (!string.IsNullOrEmpty(session.JobDescriptionId))
+                {
+                    try
+                    {
+                        var jdResponse = await cosmosContainer.ReadItemAsync<JobDescription>(
+                            session.JobDescriptionId, new PartitionKey(session.JobDescriptionId));
+                        interviewedJD = jdResponse.Resource;
+                    }
+                    catch { /* JD not found */ }
+                }
+                
+                // Fetch the candidate's resume
+                if (!string.IsNullOrEmpty(session.ResumeId))
+                {
+                    try
+                    {
+                        var resumeResponse = await cosmosContainer.ReadItemAsync<CandidateResume>(
+                            session.ResumeId, new PartitionKey(session.ResumeId));
+                        candidateResume = resumeResponse.Resource;
+                    }
+                    catch { /* Resume not found */ }
+                }
+                
+                // Fetch all job descriptions for alternative matching
+                try
+                {
+                    var query = "SELECT * FROM c WHERE c.jobTitle != null";
+                    var iterator = cosmosContainer.GetItemQueryIterator<JobDescription>(query);
+                    while (iterator.HasMoreResults)
+                    {
+                        var batch = await iterator.ReadNextAsync();
+                        allJobDescriptions.AddRange(batch);
+                    }
+                }
+                catch { /* Failed to fetch JDs */ }
+            }
+            
+            // Build candidate skills profile from transcript analysis and resume
+            var candidateSkills = new List<string>();
+            candidateSkills.AddRange(analysis.TechnicalSkills.TopicsDiscussed);
+            if (candidateResume != null)
+            {
+                candidateSkills.AddRange(candidateResume.technicalSkills ?? new List<string>());
+                candidateSkills.AddRange(candidateResume.programmingLanguages ?? new List<string>());
+                candidateSkills.AddRange(candidateResume.frameworks ?? new List<string>());
+            }
+            candidateSkills = candidateSkills.Distinct().ToList();
+            
+            // Analyze fit for the interviewed position
+            if (interviewedJD != null && candidateSkills.Any())
+            {
+                var jdSkills = new List<string>();
+                jdSkills.AddRange(interviewedJD.requiredSkills ?? new List<string>());
+                jdSkills.AddRange(interviewedJD.niceToHaveSkills ?? new List<string>());
+                
+                var matchingSkills = candidateSkills
+                    .Where(cs => jdSkills.Any(js => 
+                        js.Contains(cs, StringComparison.OrdinalIgnoreCase) || 
+                        cs.Contains(js, StringComparison.OrdinalIgnoreCase)))
+                    .ToList();
+                
+                var missingSkills = (interviewedJD.requiredSkills ?? new List<string>())
+                    .Where(rs => !candidateSkills.Any(cs => 
+                        cs.Contains(rs, StringComparison.OrdinalIgnoreCase) || 
+                        rs.Contains(cs, StringComparison.OrdinalIgnoreCase)))
+                    .ToList();
+                
+                var fitScore = jdSkills.Count > 0 
+                    ? (int)Math.Round((double)matchingSkills.Count / jdSkills.Count * 100) 
+                    : analysis.OverallScore;
+                
+                // Adjust fit score based on interview performance
+                fitScore = (fitScore + analysis.OverallScore) / 2;
+                
+                analysis.JobFitAnalysis = new JDFitAnalysis
+                {
+                    JobDescriptionId = interviewedJD.id,
+                    JobTitle = interviewedJD.jobTitle,
+                    FitScore = fitScore,
+                    FitSummary = fitScore >= 70 
+                        ? $"Strong fit for {interviewedJD.jobTitle}. Candidate demonstrates {matchingSkills.Count} of the required skills."
+                        : $"Partial fit for {interviewedJD.jobTitle}. Candidate is missing {missingSkills.Count} required skills.",
+                    MatchingSkills = matchingSkills,
+                    MissingSkills = missingSkills,
+                    IsGoodFit = fitScore >= 70
+                };
+                
+                // If not a good fit, find alternative positions
+                if (!analysis.JobFitAnalysis.IsGoodFit && allJobDescriptions.Any())
+                {
+                    var alternativeMatches = new List<AlternativeJDMatch>();
+                    
+                    foreach (var jd in allJobDescriptions.Where(j => j.id != interviewedJD.id))
+                    {
+                        var altJdSkills = new List<string>();
+                        altJdSkills.AddRange(jd.requiredSkills ?? new List<string>());
+                        altJdSkills.AddRange(jd.niceToHaveSkills ?? new List<string>());
+                        
+                        var altMatchingSkills = candidateSkills
+                            .Where(cs => altJdSkills.Any(js => 
+                                js.Contains(cs, StringComparison.OrdinalIgnoreCase) || 
+                                cs.Contains(js, StringComparison.OrdinalIgnoreCase)))
+                            .ToList();
+                        
+                        var altMatchScore = altJdSkills.Count > 0 
+                            ? (int)Math.Round((double)altMatchingSkills.Count / altJdSkills.Count * 100) 
+                            : 0;
+                        
+                        // Consider interview performance too
+                        altMatchScore = (altMatchScore + analysis.OverallScore) / 2;
+                        
+                        if (altMatchScore >= 60) // Only suggest if reasonable match
+                        {
+                            alternativeMatches.Add(new AlternativeJDMatch
+                            {
+                                JobDescriptionId = jd.id,
+                                JobTitle = jd.jobTitle,
+                                Department = jd.department,
+                                MatchScore = altMatchScore,
+                                MatchReason = $"Candidate's skills in {string.Join(", ", altMatchingSkills.Take(3))} align well with this role.",
+                                MatchingSkills = altMatchingSkills
+                            });
+                        }
+                    }
+                    
+                    // Sort by match score and take top 3
+                    analysis.AlternativeJobMatches = alternativeMatches
+                        .OrderByDescending(m => m.MatchScore)
+                        .Take(3)
+                        .ToList();
+                }
+            }
+            else if (allJobDescriptions.Any() && candidateSkills.Any())
+            {
+                // No specific JD for this interview, but we can still suggest matches
+                var alternativeMatches = new List<AlternativeJDMatch>();
+                
+                foreach (var jd in allJobDescriptions)
+                {
+                    var jdSkills = new List<string>();
+                    jdSkills.AddRange(jd.requiredSkills ?? new List<string>());
+                    jdSkills.AddRange(jd.niceToHaveSkills ?? new List<string>());
+                    
+                    var matchingSkills = candidateSkills
+                        .Where(cs => jdSkills.Any(js => 
+                            js.Contains(cs, StringComparison.OrdinalIgnoreCase) || 
+                            cs.Contains(js, StringComparison.OrdinalIgnoreCase)))
+                        .ToList();
+                    
+                    var matchScore = jdSkills.Count > 0 
+                        ? (int)Math.Round((double)matchingSkills.Count / jdSkills.Count * 100) 
+                        : 0;
+                    
+                    matchScore = (matchScore + analysis.OverallScore) / 2;
+                    
+                    if (matchScore >= 50)
+                    {
+                        alternativeMatches.Add(new AlternativeJDMatch
+                        {
+                            JobDescriptionId = jd.id,
+                            JobTitle = jd.jobTitle,
+                            Department = jd.department,
+                            MatchScore = matchScore,
+                            MatchReason = $"Based on demonstrated skills: {string.Join(", ", matchingSkills.Take(3))}",
+                            MatchingSkills = matchingSkills
+                        });
+                    }
+                }
+                
+                analysis.AlternativeJobMatches = alternativeMatches
+                    .OrderByDescending(m => m.MatchScore)
+                    .Take(5)
+                    .ToList();
+            }
+            
             session.Analysis = analysis;
             
             // Persist session with analysis to Cosmos DB
@@ -2941,6 +3125,33 @@ public class InterviewAnalysis
     public List<StrengthWeakness> AreasForImprovement { get; set; } = new();
     public string HiringRecommendation { get; set; } = string.Empty;
     public DateTime AnalyzedAt { get; set; }
+    
+    // JD Fit Analysis
+    public JDFitAnalysis? JobFitAnalysis { get; set; }
+    public List<AlternativeJDMatch>? AlternativeJobMatches { get; set; }
+}
+
+// JD Fit Analysis - how well candidate matches the interviewed position
+public class JDFitAnalysis
+{
+    public string JobDescriptionId { get; set; } = string.Empty;
+    public string JobTitle { get; set; } = string.Empty;
+    public int FitScore { get; set; } // 1-100
+    public string FitSummary { get; set; } = string.Empty;
+    public List<string> MatchingSkills { get; set; } = new();
+    public List<string> MissingSkills { get; set; } = new();
+    public bool IsGoodFit { get; set; } // true if FitScore >= 70
+}
+
+// Alternative JD Match - other positions the candidate might be suitable for
+public class AlternativeJDMatch
+{
+    public string JobDescriptionId { get; set; } = string.Empty;
+    public string JobTitle { get; set; } = string.Empty;
+    public string Department { get; set; } = string.Empty;
+    public int MatchScore { get; set; } // 1-100
+    public string MatchReason { get; set; } = string.Empty;
+    public List<string> MatchingSkills { get; set; } = new();
 }
 
 public class TechnicalAssessment
