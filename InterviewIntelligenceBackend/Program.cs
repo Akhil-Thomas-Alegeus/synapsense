@@ -9,6 +9,9 @@ using Microsoft.Extensions.Configuration;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Microsoft.Azure.Cosmos;
+using iText.Kernel.Pdf;
+using iText.Kernel.Pdf.Canvas.Parser;
+using iText.Kernel.Pdf.Canvas.Parser.Listener;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -82,6 +85,173 @@ builder.Services.AddSwaggerGen(options =>
 
 var app = builder.Build();
 
+// ========== COSMOS DB HELPER FUNCTIONS ==========
+
+// Helper to save invite to Cosmos DB
+async Task SaveInviteToCosmosAsync(InterviewInvite invite)
+{
+    if (cosmosContainer == null) return;
+    try
+    {
+        invite.id = invite.Code; // Use Code as the document ID
+        await cosmosContainer.UpsertItemAsync(invite, new PartitionKey(invite.id));
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to save invite to Cosmos DB: {ex.Message}");
+    }
+}
+
+// Helper to get invite from Cosmos DB
+async Task<InterviewInvite?> GetInviteFromCosmosAsync(string code)
+{
+    if (cosmosContainer == null) return null;
+    try
+    {
+        var response = await cosmosContainer.ReadItemAsync<InterviewInvite>(code, new PartitionKey(code));
+        return response.Resource;
+    }
+    catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return null;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to get invite from Cosmos DB: {ex.Message}");
+        return null;
+    }
+}
+
+// Helper to delete invite from Cosmos DB
+async Task DeleteInviteFromCosmosAsync(string code)
+{
+    if (cosmosContainer == null) return;
+    try
+    {
+        await cosmosContainer.DeleteItemAsync<InterviewInvite>(code, new PartitionKey(code));
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to delete invite from Cosmos DB: {ex.Message}");
+    }
+}
+
+// Helper to get all invites from Cosmos DB
+async Task<List<InterviewInvite>> GetAllInvitesFromCosmosAsync()
+{
+    var invites = new List<InterviewInvite>();
+    if (cosmosContainer == null) return invites;
+    try
+    {
+        var query = new QueryDefinition("SELECT * FROM c WHERE c.type = 'invite'");
+        var iterator = cosmosContainer.GetItemQueryIterator<InterviewInvite>(query);
+        while (iterator.HasMoreResults)
+        {
+            var response = await iterator.ReadNextAsync();
+            invites.AddRange(response);
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to get invites from Cosmos DB: {ex.Message}");
+    }
+    return invites;
+}
+
+// Helper to save session to Cosmos DB
+async Task SaveSessionToCosmosAsync(InterviewSession session)
+{
+    if (cosmosContainer == null) return;
+    try
+    {
+        session.id = session.SessionId; // Use SessionId as the document ID
+        await cosmosContainer.UpsertItemAsync(session, new PartitionKey(session.id));
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to save session to Cosmos DB: {ex.Message}");
+    }
+}
+
+// Helper to get session from Cosmos DB
+async Task<InterviewSession?> GetSessionFromCosmosAsync(string sessionId)
+{
+    if (cosmosContainer == null) return null;
+    try
+    {
+        var response = await cosmosContainer.ReadItemAsync<InterviewSession>(sessionId, new PartitionKey(sessionId));
+        return response.Resource;
+    }
+    catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return null;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to get session from Cosmos DB: {ex.Message}");
+        return null;
+    }
+}
+
+// Helper to get all sessions from Cosmos DB (both active and completed)
+async Task<List<InterviewSession>> GetAllSessionsFromCosmosAsync(bool? isEnded = null)
+{
+    var sessions = new List<InterviewSession>();
+    if (cosmosContainer == null) return sessions;
+    try
+    {
+        var queryText = isEnded.HasValue 
+            ? $"SELECT * FROM c WHERE c.type = 'session' AND c.IsEnded = {isEnded.Value.ToString().ToLower()}"
+            : "SELECT * FROM c WHERE c.type = 'session'";
+        var query = new QueryDefinition(queryText);
+        var iterator = cosmosContainer.GetItemQueryIterator<InterviewSession>(query);
+        while (iterator.HasMoreResults)
+        {
+            var response = await iterator.ReadNextAsync();
+            sessions.AddRange(response);
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to get sessions from Cosmos DB: {ex.Message}");
+    }
+    return sessions;
+}
+
+// Load existing data from Cosmos DB into memory caches on startup
+async Task LoadDataFromCosmosAsync()
+{
+    if (cosmosContainer == null) return;
+    
+    Console.WriteLine("Loading data from Cosmos DB...");
+    
+    // Load invites
+    var invites = await GetAllInvitesFromCosmosAsync();
+    foreach (var invite in invites)
+    {
+        interviewInvites[invite.Code] = invite;
+    }
+    Console.WriteLine($"Loaded {invites.Count} invites from Cosmos DB");
+    
+    // Load sessions
+    var sessions = await GetAllSessionsFromCosmosAsync();
+    foreach (var session in sessions)
+    {
+        if (session.IsEnded)
+        {
+            completedInterviews[session.SessionId] = session;
+        }
+        else
+        {
+            interviewSessions[session.SessionId] = session;
+        }
+    }
+    Console.WriteLine($"Loaded {sessions.Count} sessions from Cosmos DB");
+}
+
+// Load data on startup
+Task.Run(async () => await LoadDataFromCosmosAsync()).Wait();
+
 // Configure Swagger middleware
 if (app.Environment.IsDevelopment())
 {
@@ -135,6 +305,8 @@ app.MapPost("/api/interview/start", async (HttpContext http) =>
     var sessionId = Guid.NewGuid().ToString();
     var session = new InterviewSession
     {
+        id = sessionId, // Cosmos DB document ID
+        type = "session", // Document type
         SessionId = sessionId,
         StartTime = DateTime.UtcNow,
         QuestionCount = 0,
@@ -157,19 +329,28 @@ app.MapPost("/api/interview/start", async (HttpContext http) =>
         session.CandidateName = invite.CandidateName;
         session.CandidateEmail = invite.CandidateEmail;
         session.Position = invite.Position;
+        session.JobDescriptionId = invite.JobDescriptionId;
         
         invite.IsUsed = true;
         invite.UsedAt = DateTime.UtcNow;
         invite.SessionId = sessionId;
+        
+        // Persist invite changes to Cosmos DB
+        await SaveInviteToCosmosAsync(invite);
     }
     
+    // Save session to in-memory cache
     interviewSessions[sessionId] = session;
+    
+    // Persist session to Cosmos DB
+    await SaveSessionToCosmosAsync(session);
     
     return Results.Ok(new { 
         sessionId, 
         message = "Interview session started",
         candidateName = session.CandidateName,
-        position = session.Position
+        position = session.Position,
+        jobDescriptionId = session.JobDescriptionId
     });
 })
 .WithName("StartInterview")
@@ -270,6 +451,13 @@ app.MapPost("/api/generate-question", async (GenerateQuestionRequest req, HttpCo
             if (session.IsEnded || session.QuestionCount >= MaxQuestions || elapsedMinutes >= MaxDurationMinutes)
             {
                 session.IsEnded = true;
+                
+                // Move to completed interviews
+                completedInterviews[session.SessionId] = session;
+                interviewSessions.TryRemove(session.SessionId, out _);
+                
+                // Persist session changes to Cosmos DB
+                await SaveSessionToCosmosAsync(session);
                 
                 var thankYouMessage = $"Thank you so much for taking the time to speak with me today! I really enjoyed our conversation and learning about your experience with .NET development. {(session.QuestionCount >= MaxQuestions ? "We've covered everything I wanted to discuss" : "We've reached the end of our scheduled time")}. Our team will review everything and be in touch soon. Do you have any questions for me about the role or the team before we wrap up?";
                 
@@ -451,7 +639,7 @@ app.MapGet("/api/speech/ice", async (HttpContext http, IHttpClientFactory httpCl
 });
 
 // 4) Save Q&A exchange to transcript
-app.MapPost("/api/interview/transcript", (SaveTranscriptRequest req, HttpContext http) =>
+app.MapPost("/api/interview/transcript", async (SaveTranscriptRequest req, HttpContext http) =>
 {
     if (string.IsNullOrWhiteSpace(req.sessionId))
     {
@@ -473,6 +661,9 @@ app.MapPost("/api/interview/transcript", (SaveTranscriptRequest req, HttpContext
     };
     
     session.Transcript.Add(exchange);
+    
+    // Persist session changes to Cosmos DB
+    await SaveSessionToCosmosAsync(session);
     
     return Results.Ok(new { 
         message = "Transcript saved", 
@@ -671,6 +862,9 @@ Analyze this interview and provide your assessment as JSON.";
             
             session.Analysis = analysis;
             
+            // Persist session with analysis to Cosmos DB
+            await SaveSessionToCosmosAsync(session);
+            
             return Results.Ok(new
             {
                 sessionId = session.SessionId,
@@ -710,6 +904,9 @@ app.MapPost("/api/admin/invites", async (HttpContext http) =>
         var candidateName = json.RootElement.GetProperty("candidateName").GetString() ?? "";
         var candidateEmail = json.RootElement.TryGetProperty("candidateEmail", out var emailEl) ? emailEl.GetString() : "";
         var position = json.RootElement.TryGetProperty("position", out var posEl) ? posEl.GetString() : "Software Developer";
+        var jobDescriptionId = json.RootElement.TryGetProperty("jobDescriptionId", out var jdEl) ? jdEl.GetString() : null;
+        var resumeId = json.RootElement.TryGetProperty("resumeId", out var resumeEl) ? resumeEl.GetString() : null;
+        var resumeFileName = json.RootElement.TryGetProperty("resumeFileName", out var resumeNameEl) ? resumeNameEl.GetString() : null;
         var expiresInDays = json.RootElement.TryGetProperty("expiresInDays", out var expEl) ? expEl.GetInt32() : 7;
         
         // Generate a unique 6-character code
@@ -721,16 +918,25 @@ app.MapPost("/api/admin/invites", async (HttpContext http) =>
         
         var invite = new InterviewInvite
         {
+            id = code, // Cosmos DB document ID
+            type = "invite", // Document type
             Code = code,
             CandidateName = candidateName,
             CandidateEmail = candidateEmail,
             Position = position,
+            JobDescriptionId = jobDescriptionId,
+            ResumeId = resumeId,
+            ResumeFileName = resumeFileName,
             CreatedAt = DateTime.UtcNow,
             ExpiresAt = DateTime.UtcNow.AddDays(expiresInDays),
             IsUsed = false
         };
         
+        // Save to in-memory cache
         interviewInvites[code] = invite;
+        
+        // Persist to Cosmos DB
+        await SaveInviteToCosmosAsync(invite);
         
         return Results.Ok(new
         {
@@ -738,6 +944,10 @@ app.MapPost("/api/admin/invites", async (HttpContext http) =>
             candidateName = invite.CandidateName,
             candidateEmail = invite.CandidateEmail,
             position = invite.Position,
+            jobDescriptionId = invite.JobDescriptionId,
+            hasResume = !string.IsNullOrEmpty(invite.ResumeId),
+            resumeId = invite.ResumeId,
+            resumeFileName = invite.ResumeFileName,
             expiresAt = invite.ExpiresAt,
             interviewUrl = $"https://your-domain.com?code={invite.Code}" // Frontend will use this
         });
@@ -765,6 +975,10 @@ app.MapGet("/api/admin/invites", () =>
             candidateName = i.CandidateName,
             candidateEmail = i.CandidateEmail,
             position = i.Position,
+            jobDescriptionId = i.JobDescriptionId,
+            hasResume = !string.IsNullOrEmpty(i.ResumeId),
+            resumeId = i.ResumeId,
+            resumeFileName = i.ResumeFileName,
             createdAt = i.CreatedAt,
             expiresAt = i.ExpiresAt,
             isUsed = i.IsUsed,
@@ -821,11 +1035,13 @@ app.MapGet("/api/invite/validate/{code}", (string code) =>
 });
 
 // Delete an invite
-app.MapDelete("/api/admin/invites/{code}", (string code) =>
+app.MapDelete("/api/admin/invites/{code}", async (string code) =>
 {
     var upperCode = code.ToUpper();
     if (interviewInvites.TryRemove(upperCode, out _))
     {
+        // Also delete from Cosmos DB
+        await DeleteInviteFromCosmosAsync(upperCode);
         return Results.Ok(new { message = "Invite deleted" });
     }
     return Results.NotFound(new { error = "Invite not found" });
@@ -836,6 +1052,292 @@ app.MapDelete("/api/admin/invites/{code}", (string code) =>
     Summary = "Delete an invite code",
     Description = "Removes an invite code from the system"
 });
+
+// ===== RESUME PARSING AND STORAGE =====
+
+// Parse resume using LLM and store in Cosmos DB
+app.MapPost("/api/resumes/parse", async (HttpContext http) =>
+{
+    try
+    {
+        using var reader = new StreamReader(http.Request.Body);
+        var body = await reader.ReadToEndAsync();
+        var json = JsonDocument.Parse(body);
+        
+        var resumeText = json.RootElement.GetProperty("resumeText").GetString() ?? "";
+        var candidateName = json.RootElement.TryGetProperty("candidateName", out var nameEl) ? nameEl.GetString() : "";
+        var candidateEmail = json.RootElement.TryGetProperty("candidateEmail", out var emailEl) ? emailEl.GetString() : "";
+        var fileName = json.RootElement.TryGetProperty("fileName", out var fileEl) ? fileEl.GetString() : "";
+        var inviteCode = json.RootElement.TryGetProperty("inviteCode", out var codeEl) ? codeEl.GetString() : null;
+
+        if (string.IsNullOrWhiteSpace(resumeText))
+        {
+            return Results.BadRequest(new { error = "No resume text provided" });
+        }
+
+        // Use Azure OpenAI to parse the resume
+        var openAiKey = builder.Configuration["Azure:OpenAI:Key"];
+        var openAiEndpoint = builder.Configuration["Azure:OpenAI:Endpoint"];
+        var deploymentId = builder.Configuration["Azure:OpenAI:DeploymentId"];
+
+        if (string.IsNullOrEmpty(openAiKey) || string.IsNullOrEmpty(openAiEndpoint))
+        {
+            return Results.Problem("Azure OpenAI is not configured");
+        }
+
+        var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("api-key", openAiKey);
+
+        var prompt = $@"Parse the following resume and extract key information. Return a JSON object with these fields:
+
+- summary (string): A 2-3 sentence professional summary of the candidate
+- currentRole (string): Their most recent/current job title
+- yearsOfExperience (number): Estimated total years of professional experience
+- technicalSkills (array of strings): Technical skills like databases, cloud platforms, architectures
+- softSkills (array of strings): Soft skills like leadership, communication, teamwork
+- programmingLanguages (array of strings): Programming languages they know
+- frameworks (array of strings): Frameworks and libraries (e.g., React, .NET, Spring)
+- tools (array of strings): Tools and platforms (e.g., Git, Docker, Azure, AWS)
+- certifications (array of strings): Professional certifications
+- workExperience (array of objects): Recent work experience, each with:
+  - company (string)
+  - title (string)
+  - duration (string)
+  - highlights (array of strings): Key achievements/responsibilities
+- education (array of objects): Education background, each with:
+  - institution (string)
+  - degree (string)
+  - field (string)
+  - year (string)
+- achievements (array of strings): Notable achievements, awards, or recognitions
+- suggestedInterviewTopics (array of strings): Topics to ask about based on their experience
+- potentialStrengths (array of strings): Areas where they appear strong
+- areasToProbe (array of strings): Areas that need clarification or deeper questioning
+
+RESUME TEXT:
+{resumeText}
+
+Return ONLY valid JSON, no markdown or explanation.";
+
+        var requestBody = new
+        {
+            messages = new[]
+            {
+                new { role = "system", content = "You are an expert HR analyst and technical recruiter. Parse resumes accurately and extract structured information. Always return valid JSON." },
+                new { role = "user", content = prompt }
+            },
+            max_tokens = 4000,
+            temperature = 0.3
+        };
+
+        var response = await client.PostAsync(
+            $"{openAiEndpoint}/openai/deployments/{deploymentId}/chat/completions?api-version=2024-02-15-preview",
+            new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json")
+        );
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            return Results.Problem($"OpenAI API error: {errorContent}");
+        }
+
+        var responseContent = await response.Content.ReadAsStringAsync();
+        var openAiResponse = JsonDocument.Parse(responseContent);
+        var messageContent = openAiResponse.RootElement
+            .GetProperty("choices")[0]
+            .GetProperty("message")
+            .GetProperty("content")
+            .GetString() ?? "{}";
+
+        // Clean up the response (remove markdown code blocks if present)
+        messageContent = messageContent.Trim();
+        if (messageContent.StartsWith("```json"))
+        {
+            messageContent = messageContent.Substring(7);
+        }
+        if (messageContent.StartsWith("```"))
+        {
+            messageContent = messageContent.Substring(3);
+        }
+        if (messageContent.EndsWith("```"))
+        {
+            messageContent = messageContent.Substring(0, messageContent.Length - 3);
+        }
+        messageContent = messageContent.Trim();
+
+        // Parse the LLM response
+        var parsedResume = JsonSerializer.Deserialize<JsonElement>(messageContent);
+        
+        // Create resume document for Cosmos DB
+        var resumeId = Guid.NewGuid().ToString();
+        var resumeDoc = new CandidateResume
+        {
+            id = resumeId,
+            type = "resume",
+            candidateName = candidateName ?? "",
+            candidateEmail = candidateEmail,
+            fileName = fileName,
+            summary = parsedResume.TryGetProperty("summary", out var s) ? s.GetString() : null,
+            currentRole = parsedResume.TryGetProperty("currentRole", out var cr) ? cr.GetString() : null,
+            yearsOfExperience = parsedResume.TryGetProperty("yearsOfExperience", out var yoe) ? yoe.GetInt32() : null,
+            technicalSkills = GetStringArray(parsedResume, "technicalSkills"),
+            softSkills = GetStringArray(parsedResume, "softSkills"),
+            programmingLanguages = GetStringArray(parsedResume, "programmingLanguages"),
+            frameworks = GetStringArray(parsedResume, "frameworks"),
+            tools = GetStringArray(parsedResume, "tools"),
+            certifications = GetStringArray(parsedResume, "certifications"),
+            achievements = GetStringArray(parsedResume, "achievements"),
+            suggestedInterviewTopics = GetStringArray(parsedResume, "suggestedInterviewTopics"),
+            potentialStrengths = GetStringArray(parsedResume, "potentialStrengths"),
+            areasToProbe = GetStringArray(parsedResume, "areasToProbe"),
+            createdAt = DateTime.UtcNow.ToString("o"),
+            inviteCode = inviteCode
+        };
+
+        // Parse work experience
+        if (parsedResume.TryGetProperty("workExperience", out var weArray) && weArray.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var we in weArray.EnumerateArray())
+            {
+                resumeDoc.workExperience.Add(new WorkExperience
+                {
+                    company = we.TryGetProperty("company", out var c) ? c.GetString() : null,
+                    title = we.TryGetProperty("title", out var t) ? t.GetString() : null,
+                    duration = we.TryGetProperty("duration", out var d) ? d.GetString() : null,
+                    highlights = we.TryGetProperty("highlights", out var h) && h.ValueKind == JsonValueKind.Array
+                        ? h.EnumerateArray().Select(x => x.GetString() ?? "").ToList()
+                        : new List<string>()
+                });
+            }
+        }
+
+        // Parse education
+        if (parsedResume.TryGetProperty("education", out var eduArray) && eduArray.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var edu in eduArray.EnumerateArray())
+            {
+                resumeDoc.education.Add(new Education
+                {
+                    institution = edu.TryGetProperty("institution", out var i) ? i.GetString() : null,
+                    degree = edu.TryGetProperty("degree", out var deg) ? deg.GetString() : null,
+                    field = edu.TryGetProperty("field", out var f) ? f.GetString() : null,
+                    year = edu.TryGetProperty("year", out var y) ? y.GetString() : null
+                });
+            }
+        }
+
+        // Store in Cosmos DB
+        if (cosmosContainer != null)
+        {
+            await cosmosContainer.CreateItemAsync(resumeDoc, new PartitionKey(resumeDoc.id));
+        }
+
+        return Results.Ok(new
+        {
+            id = resumeDoc.id,
+            candidateName = resumeDoc.candidateName,
+            summary = resumeDoc.summary,
+            currentRole = resumeDoc.currentRole,
+            yearsOfExperience = resumeDoc.yearsOfExperience,
+            technicalSkills = resumeDoc.technicalSkills,
+            softSkills = resumeDoc.softSkills,
+            programmingLanguages = resumeDoc.programmingLanguages,
+            frameworks = resumeDoc.frameworks,
+            tools = resumeDoc.tools,
+            certifications = resumeDoc.certifications,
+            workExperience = resumeDoc.workExperience,
+            education = resumeDoc.education,
+            achievements = resumeDoc.achievements,
+            suggestedInterviewTopics = resumeDoc.suggestedInterviewTopics,
+            potentialStrengths = resumeDoc.potentialStrengths,
+            areasToProbe = resumeDoc.areasToProbe,
+            inviteCode = resumeDoc.inviteCode
+        });
+    }
+    catch (JsonException ex)
+    {
+        return Results.BadRequest(new { error = "Failed to parse resume", details = ex.Message });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to parse resume: {ex.Message}");
+    }
+})
+.WithName("ParseResume")
+.WithTags("Resumes")
+.WithOpenApi(operation => new(operation)
+{
+    Summary = "Parse resume using LLM and store in Cosmos DB",
+    Description = "Extracts key information from resume text using AI and stores the structured data"
+});
+
+// Get resume by ID
+app.MapGet("/api/resumes/{id}", async (string id) =>
+{
+    if (cosmosContainer == null)
+    {
+        return Results.Problem("Cosmos DB is not configured");
+    }
+
+    try
+    {
+        var response = await cosmosContainer.ReadItemAsync<CandidateResume>(id, new PartitionKey(id));
+        return Results.Ok(response.Resource);
+    }
+    catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return Results.NotFound(new { error = "Resume not found" });
+    }
+})
+.WithName("GetResume")
+.WithTags("Resumes");
+
+// Get resume by invite code
+app.MapGet("/api/resumes/by-invite/{code}", async (string code) =>
+{
+    if (cosmosContainer == null)
+    {
+        return Results.Problem("Cosmos DB is not configured");
+    }
+
+    try
+    {
+        var query = new QueryDefinition("SELECT * FROM c WHERE c.type = 'resume' AND c.inviteCode = @code")
+            .WithParameter("@code", code.ToUpper());
+        
+        var iterator = cosmosContainer.GetItemQueryIterator<CandidateResume>(query);
+        var results = new List<CandidateResume>();
+        
+        while (iterator.HasMoreResults)
+        {
+            var response = await iterator.ReadNextAsync();
+            results.AddRange(response);
+        }
+
+        if (results.Count == 0)
+        {
+            return Results.NotFound(new { error = "No resume found for this invite code" });
+        }
+
+        return Results.Ok(results.First());
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to fetch resume: {ex.Message}");
+    }
+})
+.WithName("GetResumeByInviteCode")
+.WithTags("Resumes");
+
+// Helper function to extract string arrays from JSON
+static List<string> GetStringArray(JsonElement element, string propertyName)
+{
+    if (element.TryGetProperty(propertyName, out var arr) && arr.ValueKind == JsonValueKind.Array)
+    {
+        return arr.EnumerateArray().Select(x => x.GetString() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList();
+    }
+    return new List<string>();
+}
 
 // ===== INTERVIEW MANAGEMENT =====
 
@@ -999,6 +1501,7 @@ app.MapPost("/api/admin/interviews/{sessionId}/complete", async (string sessionI
     {
         session.IsEnded = true;
         completedInterviews[sessionId] = session;
+        interviewSessions.TryRemove(sessionId, out _);
         
         // Auto-save transcript to blob storage
         if (blobContainerClient != null && session.Transcript.Count > 0)
@@ -1028,6 +1531,9 @@ app.MapPost("/api/admin/interviews/{sessionId}/complete", async (string sessionI
                 Console.WriteLine($"Failed to save transcript to blob: {ex.Message}");
             }
         }
+        
+        // Persist session changes to Cosmos DB
+        await SaveSessionToCosmosAsync(session);
         
         return Results.Ok(new { message = "Interview marked as complete", sessionId = sessionId });
     }
@@ -1066,13 +1572,22 @@ app.MapPost("/api/storage/upload-video/{sessionId}", async (string sessionId, Ht
         await blobClient.UploadAsync(memoryStream, new BlobHttpHeaders { ContentType = contentType });
         
         // Update session with video URL
+        InterviewSession? sessionToUpdate = null;
         if (interviewSessions.TryGetValue(sessionId, out var session))
         {
             session.VideoBlobUrl = blobClient.Uri.ToString();
+            sessionToUpdate = session;
         }
         else if (completedInterviews.TryGetValue(sessionId, out var completedSession))
         {
             completedSession.VideoBlobUrl = blobClient.Uri.ToString();
+            sessionToUpdate = completedSession;
+        }
+        
+        // Persist session changes to Cosmos DB
+        if (sessionToUpdate != null)
+        {
+            await SaveSessionToCosmosAsync(sessionToUpdate);
         }
         
         return Results.Ok(new { 
@@ -1252,6 +1767,9 @@ app.MapPost("/api/admin/interviews/{sessionId}/analyze-video", async (string ses
         // Store the analysis
         session.VideoAnalysis = analysisResult;
         
+        // Persist session with video analysis to Cosmos DB
+        await SaveSessionToCosmosAsync(session);
+        
         return Results.Ok(new
         {
             sessionId = sessionId,
@@ -1351,6 +1869,9 @@ app.MapPost("/api/admin/interviews/{sessionId}/analyze-combined", async (string 
         
         session.CombinedAnalysis = combinedResult;
         
+        // Persist session with combined analysis to Cosmos DB
+        await SaveSessionToCosmosAsync(session);
+        
         return Results.Ok(new
         {
             sessionId = sessionId,
@@ -1447,6 +1968,269 @@ app.MapPost("/api/job-descriptions", async (JobDescription jobDescription) =>
 {
     Summary = "Create a new job description",
     Description = "Creates a new job description in Cosmos DB"
+});
+
+// Parse bulk job descriptions using LLM
+app.MapPost("/api/job-descriptions/parse", async (HttpContext http) =>
+{
+    try
+    {
+        using var reader = new StreamReader(http.Request.Body);
+        var body = await reader.ReadToEndAsync();
+        var json = JsonDocument.Parse(body);
+        var text = json.RootElement.GetProperty("text").GetString() ?? "";
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return Results.BadRequest(new { error = "No text provided to parse" });
+        }
+
+        // Use Azure OpenAI to parse the job descriptions
+        var openAiKey = builder.Configuration["Azure:OpenAI:Key"];
+        var openAiEndpoint = builder.Configuration["Azure:OpenAI:Endpoint"];
+        var deploymentId = builder.Configuration["Azure:OpenAI:DeploymentId"];
+
+        if (string.IsNullOrEmpty(openAiKey) || string.IsNullOrEmpty(openAiEndpoint))
+        {
+            return Results.Problem("Azure OpenAI is not configured");
+        }
+
+        var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("api-key", openAiKey);
+
+        var prompt = $@"Parse the following text and extract job descriptions. Return a JSON object with a 'jobDescriptions' array.
+
+Each job description should have these fields:
+- jobTitle (string, required): The job title/position name
+- department (string): The department (e.g., Engineering, Marketing, Sales, HR, Finance, Operations, Product, Design, Customer Support, Other)
+- experienceLevel (string): One of: Entry Level, Mid Level, Senior, Lead, Manager, Director, Executive
+- employmentType (string): One of: Full-time, Part-time, Contract, Internship
+- description (string): A brief overview of the role
+- responsibilities (string): Key responsibilities, can be bullet points
+- requiredSkills (array of strings): Required technical and soft skills
+- niceToHaveSkills (array of strings): Nice-to-have skills
+- qualifications (string): Educational and other qualifications
+- interviewTopics (string): Key topics to evaluate during interview
+- evaluationCriteria (string): How to evaluate candidates
+
+If any field is not found in the text, use reasonable defaults or leave empty.
+Parse ALL job descriptions found in the text.
+
+TEXT TO PARSE:
+{text}
+
+Return ONLY valid JSON, no markdown or explanation.";
+
+        var requestBody = new
+        {
+            messages = new[]
+            {
+                new { role = "system", content = "You are a helpful assistant that parses job descriptions into structured JSON format. Always return valid JSON." },
+                new { role = "user", content = prompt }
+            },
+            max_tokens = 4000,
+            temperature = 0.3
+        };
+
+        var response = await client.PostAsync(
+            $"{openAiEndpoint}/openai/deployments/{deploymentId}/chat/completions?api-version=2024-02-15-preview",
+            new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json")
+        );
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            return Results.Problem($"OpenAI API error: {errorContent}");
+        }
+
+        var responseContent = await response.Content.ReadAsStringAsync();
+        var openAiResponse = JsonDocument.Parse(responseContent);
+        var messageContent = openAiResponse.RootElement
+            .GetProperty("choices")[0]
+            .GetProperty("message")
+            .GetProperty("content")
+            .GetString() ?? "{}";
+
+        // Clean up the response (remove markdown code blocks if present)
+        messageContent = messageContent.Trim();
+        if (messageContent.StartsWith("```json"))
+        {
+            messageContent = messageContent.Substring(7);
+        }
+        if (messageContent.StartsWith("```"))
+        {
+            messageContent = messageContent.Substring(3);
+        }
+        if (messageContent.EndsWith("```"))
+        {
+            messageContent = messageContent.Substring(0, messageContent.Length - 3);
+        }
+        messageContent = messageContent.Trim();
+
+        // Parse and return the job descriptions
+        var parsedResult = JsonDocument.Parse(messageContent);
+        return Results.Ok(JsonSerializer.Deserialize<object>(messageContent));
+    }
+    catch (JsonException ex)
+    {
+        return Results.BadRequest(new { error = "Failed to parse LLM response as JSON", details = ex.Message });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to parse job descriptions: {ex.Message}");
+    }
+})
+.WithName("ParseJobDescriptions")
+.WithTags("Job Descriptions")
+.WithOpenApi(operation => new(operation)
+{
+    Summary = "Parse bulk job descriptions using AI",
+    Description = "Uses Azure OpenAI to parse unstructured job description text into structured JSON format"
+});
+
+// Parse PDF file containing job descriptions
+app.MapPost("/api/job-descriptions/parse-pdf", async (HttpContext http) =>
+{
+    try
+    {
+        var form = await http.Request.ReadFormAsync();
+        var file = form.Files.GetFile("file");
+
+        if (file == null || file.Length == 0)
+        {
+            return Results.BadRequest(new { error = "No file uploaded" });
+        }
+
+        if (!file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            return Results.BadRequest(new { error = "Only PDF files are supported" });
+        }
+
+        // Extract text from PDF using iText7
+        string extractedText;
+        using (var stream = file.OpenReadStream())
+        using (var pdfReader = new PdfReader(stream))
+        using (var pdfDocument = new PdfDocument(pdfReader))
+        {
+            var textBuilder = new StringBuilder();
+            for (int i = 1; i <= pdfDocument.GetNumberOfPages(); i++)
+            {
+                var page = pdfDocument.GetPage(i);
+                var strategy = new SimpleTextExtractionStrategy();
+                var pageText = PdfTextExtractor.GetTextFromPage(page, strategy);
+                textBuilder.AppendLine(pageText);
+                textBuilder.AppendLine(); // Add spacing between pages
+            }
+            extractedText = textBuilder.ToString();
+        }
+
+        if (string.IsNullOrWhiteSpace(extractedText))
+        {
+            return Results.BadRequest(new { error = "Could not extract text from PDF" });
+        }
+
+        // Use Azure OpenAI to parse the extracted text
+        var openAiKey = builder.Configuration["Azure:OpenAI:Key"];
+        var openAiEndpoint = builder.Configuration["Azure:OpenAI:Endpoint"];
+        var deploymentId = builder.Configuration["Azure:OpenAI:DeploymentId"];
+
+        if (string.IsNullOrEmpty(openAiKey) || string.IsNullOrEmpty(openAiEndpoint))
+        {
+            return Results.Problem("Azure OpenAI is not configured");
+        }
+
+        var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("api-key", openAiKey);
+
+        var prompt = $@"Parse the following text extracted from a PDF and extract job descriptions. Return a JSON object with a 'jobDescriptions' array.
+
+Each job description should have these fields:
+- jobTitle (string, required): The job title/position name
+- department (string): The department (e.g., Engineering, Marketing, Sales, HR, Finance, Operations, Product, Design, Customer Support, Other)
+- experienceLevel (string): One of: Entry Level, Mid Level, Senior, Lead, Manager, Director, Executive
+- employmentType (string): One of: Full-time, Part-time, Contract, Internship
+- description (string): A brief overview of the role
+- responsibilities (string): Key responsibilities, can be bullet points
+- requiredSkills (array of strings): Required technical and soft skills
+- niceToHaveSkills (array of strings): Nice-to-have skills
+- qualifications (string): Educational and other qualifications
+- interviewTopics (string): Key topics to evaluate during interview
+- evaluationCriteria (string): How to evaluate candidates
+
+If any field is not found in the text, use reasonable defaults or leave empty.
+Parse ALL job descriptions found in the text.
+
+TEXT FROM PDF:
+{extractedText}
+
+Return ONLY valid JSON, no markdown or explanation.";
+
+        var requestBody = new
+        {
+            messages = new[]
+            {
+                new { role = "system", content = "You are a helpful assistant that parses job descriptions into structured JSON format. Always return valid JSON." },
+                new { role = "user", content = prompt }
+            },
+            max_tokens = 4000,
+            temperature = 0.3
+        };
+
+        var response = await client.PostAsync(
+            $"{openAiEndpoint}/openai/deployments/{deploymentId}/chat/completions?api-version=2024-02-15-preview",
+            new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json")
+        );
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            return Results.Problem($"OpenAI API error: {errorContent}");
+        }
+
+        var responseContent = await response.Content.ReadAsStringAsync();
+        var openAiResponse = JsonDocument.Parse(responseContent);
+        var messageContent = openAiResponse.RootElement
+            .GetProperty("choices")[0]
+            .GetProperty("message")
+            .GetProperty("content")
+            .GetString() ?? "{}";
+
+        // Clean up the response (remove markdown code blocks if present)
+        messageContent = messageContent.Trim();
+        if (messageContent.StartsWith("```json"))
+        {
+            messageContent = messageContent.Substring(7);
+        }
+        if (messageContent.StartsWith("```"))
+        {
+            messageContent = messageContent.Substring(3);
+        }
+        if (messageContent.EndsWith("```"))
+        {
+            messageContent = messageContent.Substring(0, messageContent.Length - 3);
+        }
+        messageContent = messageContent.Trim();
+
+        // Parse and return the job descriptions
+        var parsedResult = JsonDocument.Parse(messageContent);
+        return Results.Ok(JsonSerializer.Deserialize<object>(messageContent));
+    }
+    catch (JsonException ex)
+    {
+        return Results.BadRequest(new { error = "Failed to parse LLM response as JSON", details = ex.Message });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to parse PDF: {ex.Message}");
+    }
+})
+.WithName("ParseJobDescriptionsPdf")
+.WithTags("Job Descriptions")
+.DisableAntiforgery()
+.WithOpenApi(operation => new(operation)
+{
+    Summary = "Parse job descriptions from PDF using AI",
+    Description = "Extracts text from PDF and uses Azure OpenAI to parse into structured JSON format"
 });
 
 // Get all job descriptions
@@ -1907,10 +2691,15 @@ public record GenerateQuestionResponse(string question, bool isInterviewEnded = 
 
 public class InterviewInvite
 {
+    public string id { get; set; } = string.Empty; // Cosmos DB requires lowercase 'id'
+    public string type { get; set; } = "invite"; // Document type for Cosmos DB
     public string Code { get; set; } = string.Empty;
     public string CandidateName { get; set; } = string.Empty;
     public string? CandidateEmail { get; set; }
     public string? Position { get; set; }
+    public string? JobDescriptionId { get; set; }
+    public string? ResumeId { get; set; } // Reference to parsed resume in Cosmos DB
+    public string? ResumeFileName { get; set; }
     public DateTime CreatedAt { get; set; }
     public DateTime ExpiresAt { get; set; }
     public bool IsUsed { get; set; }
@@ -1920,6 +2709,8 @@ public class InterviewInvite
 
 public class InterviewSession
 {
+    public string id { get; set; } = string.Empty; // Cosmos DB requires lowercase 'id'
+    public string type { get; set; } = "session"; // Document type for Cosmos DB
     public string SessionId { get; set; } = string.Empty;
     public DateTime StartTime { get; set; }
     public int QuestionCount { get; set; }
@@ -1928,6 +2719,7 @@ public class InterviewSession
     public string? CandidateName { get; set; }
     public string? CandidateEmail { get; set; }
     public string? Position { get; set; }
+    public string? JobDescriptionId { get; set; }
     public string? InviteCode { get; set; } // Links back to invite
     public InterviewAnalysis? Analysis { get; set; }
     public VideoAnalysisResult? VideoAnalysis { get; set; } // Video behavioral analysis
@@ -2084,3 +2876,49 @@ public class JobDescription
     public string createdBy { get; set; } = string.Empty;
 }
 
+// ========== CANDIDATE RESUME MODEL ==========
+
+public class CandidateResume
+{
+    public string id { get; set; } = string.Empty;
+    public string type { get; set; } = "resume"; // Document type for Cosmos DB
+    public string candidateName { get; set; } = string.Empty;
+    public string? candidateEmail { get; set; }
+    public string? fileName { get; set; }
+    
+    // Parsed resume fields
+    public string? summary { get; set; }
+    public string? currentRole { get; set; }
+    public int? yearsOfExperience { get; set; }
+    public List<string> technicalSkills { get; set; } = new();
+    public List<string> softSkills { get; set; } = new();
+    public List<string> programmingLanguages { get; set; } = new();
+    public List<string> frameworks { get; set; } = new();
+    public List<string> tools { get; set; } = new();
+    public List<string> certifications { get; set; } = new();
+    public List<WorkExperience> workExperience { get; set; } = new();
+    public List<Education> education { get; set; } = new();
+    public List<string> achievements { get; set; } = new();
+    public List<string> suggestedInterviewTopics { get; set; } = new();
+    public List<string> potentialStrengths { get; set; } = new();
+    public List<string> areasToProbe { get; set; } = new();
+    
+    public string createdAt { get; set; } = string.Empty;
+    public string? inviteCode { get; set; }
+}
+
+public class WorkExperience
+{
+    public string? company { get; set; }
+    public string? title { get; set; }
+    public string? duration { get; set; }
+    public List<string> highlights { get; set; } = new();
+}
+
+public class Education
+{
+    public string? institution { get; set; }
+    public string? degree { get; set; }
+    public string? field { get; set; }
+    public string? year { get; set; }
+}
