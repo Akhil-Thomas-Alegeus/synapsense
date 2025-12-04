@@ -1,3 +1,6 @@
 /InterviewIntelligenceBackend/.vs
 /InterviewIntelligenceBackend/bin
 /InterviewIntelligenceBackend/obj
+
+# Development settings with secrets
+**/appsettings.Development.json
