@@ -859,12 +859,31 @@ app.MapPost("/api/interview/analyze", async (AnalyzeInterviewRequest req, HttpCo
         return Results.BadRequest(new { error = "sessionId is required" });
     }
     
-    if (!interviewSessions.TryGetValue(req.sessionId, out var session))
+    // Look in active sessions first, then completed interviews, then Cosmos DB
+    InterviewSession? session = null;
+    if (!interviewSessions.TryGetValue(req.sessionId, out session))
+    {
+        if (!completedInterviews.TryGetValue(req.sessionId, out session))
+        {
+            // Try to fetch from Cosmos DB
+            if (cosmosContainer != null)
+            {
+                try
+                {
+                    var cosmosResponse = await cosmosContainer.ReadItemAsync<InterviewSession>(req.sessionId, new PartitionKey(req.sessionId));
+                    session = cosmosResponse.Resource;
+                }
+                catch { /* Not found in Cosmos DB */ }
+            }
+        }
+    }
+    
+    if (session == null)
     {
         return Results.NotFound(new { error = "Session not found" });
     }
     
-    if (session.Transcript.Count == 0)
+    if (session.Transcript == null || session.Transcript.Count == 0)
     {
         return Results.BadRequest(new { error = "No transcript data to analyze" });
     }
@@ -1847,11 +1866,23 @@ app.MapGet("/api/storage/status", () =>
 // Analyze interview video using Azure Face API
 app.MapPost("/api/admin/interviews/{sessionId}/analyze-video", async (string sessionId, IHttpClientFactory httpClientFactory, IConfiguration config) =>
 {
-    // Get the interview session
+    // Get the interview session - check active, completed, and Cosmos DB
     InterviewSession? session = null;
     if (!completedInterviews.TryGetValue(sessionId, out session))
     {
-        interviewSessions.TryGetValue(sessionId, out session);
+        if (!interviewSessions.TryGetValue(sessionId, out session))
+        {
+            // Try Cosmos DB
+            if (cosmosContainer != null)
+            {
+                try
+                {
+                    var response = await cosmosContainer.ReadItemAsync<InterviewSession>(sessionId, new PartitionKey(sessionId));
+                    session = response.Resource;
+                }
+                catch { /* Not found */ }
+            }
+        }
     }
     
     if (session == null)
@@ -1975,7 +2006,19 @@ app.MapPost("/api/admin/interviews/{sessionId}/analyze-combined", async (string 
     InterviewSession? session = null;
     if (!completedInterviews.TryGetValue(sessionId, out session))
     {
-        interviewSessions.TryGetValue(sessionId, out session);
+        if (!interviewSessions.TryGetValue(sessionId, out session))
+        {
+            // Try Cosmos DB
+            if (cosmosContainer != null)
+            {
+                try
+                {
+                    var response = await cosmosContainer.ReadItemAsync<InterviewSession>(sessionId, new PartitionKey(sessionId));
+                    session = response.Resource;
+                }
+                catch { /* Not found */ }
+            }
+        }
     }
     
     if (session == null)
