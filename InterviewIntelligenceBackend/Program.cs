@@ -19,7 +19,7 @@ var builder = WebApplication.CreateBuilder(args);
 var interviewSessions = new ConcurrentDictionary<string, InterviewSession>();
 var completedInterviews = new ConcurrentDictionary<string, InterviewSession>(); // Store completed interviews
 var interviewInvites = new ConcurrentDictionary<string, InterviewInvite>(); // Store invite codes
-const int MaxQuestions = 3;
+const int MaxQuestions = 20;
 const int MaxDurationMinutes = 30;
 
 // Azure Blob Storage client
@@ -463,7 +463,7 @@ app.MapPost("/api/generate-question", async (GenerateQuestionRequest req, HttpCo
                 // Persist session changes to Cosmos DB
                 await SaveSessionToCosmosAsync(session);
                 
-                var thankYouMessage = $"Thank you so much for taking the time to speak with me today! I really enjoyed our conversation and learning about your experience. {(session.QuestionCount >= MaxQuestions ? "We've covered everything I wanted to discuss" : "We've reached the end of our scheduled time")}. Our team will review everything and be in touch soon. Do you have any questions for me about the role or the team before we wrap up?";
+                var thankYouMessage = $"Well, hey, that was great! Really enjoyed chatting with you and hearing about your experience. {(session.QuestionCount >= MaxQuestions ? "I think we covered everything I wanted to touch on" : "Looks like we're at time")}. The team will go through everything and get back to you soon. Before we wrap up though - any questions for me about the role or the team?";
                 
                 await http.Response.WriteAsJsonAsync(new GenerateQuestionResponse(thankYouMessage, true, session.QuestionCount, elapsedMinutes));
                 return;
@@ -593,11 +593,24 @@ app.MapPost("/api/generate-question", async (GenerateQuestionRequest req, HttpCo
     
     systemPromptBuilder.AppendLine(@"
 
-TONE & STYLE:
-- Be warm, encouraging, and professionally friendly
-- Always start with a brief, positive acknowledgment of the candidate's answer (1 short sentence)
-- Then ask your follow-up question
-- Keep your total response concise (2-3 sentences max)
+TONE & STYLE (Sound Like a Real Human Interviewer):
+- Be warm, encouraging, and conversationally natural - like a friendly colleague, not a robot
+- Use natural speech patterns: contractions (""I'd"", ""you've"", ""that's""), filler phrases (""you know"", ""I mean""), and casual transitions
+- Occasionally use brief verbal acknowledgments like ""Mm-hmm"", ""Right"", ""Got it"", ""Interesting"", ""I see""
+- Vary your sentence structure - mix short and long sentences, don't always follow the same pattern
+- Add subtle personality: show genuine curiosity, light humor when appropriate, or relatable observations
+- Use natural pauses in your speech by using commas and ellipses sparingly (""So... tell me more about"")
+- Reference things conversationally: ""That reminds me..."", ""Oh, that's interesting because..."", ""I was just thinking...""
+- Avoid overly formal phrases like ""I appreciate you sharing"" or ""That's a great point"" every time - mix it up!
+- Sometimes start with the question directly if the flow feels natural
+
+RESPONSE VARIATIONS (Use Different Openings):
+- Positive: ""Nice!"", ""Love that."", ""That's cool."", ""Oh wow."", ""Interesting!""
+- Transitional: ""So..."", ""Okay, so..."", ""Alright..."", ""Gotcha.""
+- Curious: ""Hmm..."", ""Oh?"", ""Really?""
+- Affirmative: ""Right, right."", ""Yeah."", ""Makes sense.""
+
+Keep your total response concise (2-3 sentences max).
 
 INTERVIEW STRATEGY:");
     
@@ -624,11 +637,15 @@ INTERVIEW STRATEGY:");
     systemPromptBuilder.AppendLine(@"
 - Stay within the context of the current interview conversation
 - If the candidate goes off-topic, gently and kindly redirect back to relevant topics
+- Don't be afraid to go slightly off-script if something genuinely interesting comes up
 
-EXAMPLE FORMAT:
-'That's a great point about [topic]! [Follow-up question specific to their experience or the job requirements]'
-or
-'I appreciate you sharing that experience. [Question about a specific project or skill from their resume]'");
+EXAMPLE NATURAL RESPONSES:
+'Oh nice, microservices at that scale is no joke! How did you guys handle the deployment pipeline?'
+'Gotcha. So when that happened, what was your first instinct?'
+'Hmm, interesting. I'm curious - did you ever run into issues with [specific tech from their resume]?'
+'Right, that makes sense. So tell me more about how you approached the testing side of things.'
+'Oh wow, working with [company from resume] must've been intense. What was the biggest challenge there?'
+'Yeah, I've heard that can get tricky. Walk me through how you'd solve something like that today.'");
 
     var systemPrompt = systemPromptBuilder.ToString();
 
@@ -648,7 +665,7 @@ or
     }
     
     userPromptBuilder.AppendLine($"\nCandidate's latest answer: \"{req.text}\"");
-    userPromptBuilder.AppendLine("\nRemember: Start with short feedback (1 sentence), then ask your question. Be warm and professional. Ask something SPECIFIC based on their resume or the job requirements if available.");
+    userPromptBuilder.AppendLine("\nRespond naturally like a real interviewer would - vary your acknowledgments, use contractions, and ask something SPECIFIC based on their resume or the job requirements if available. Don't sound scripted.");
 
     var userPrompt = userPromptBuilder.ToString();
 
@@ -663,7 +680,9 @@ or
             new { role = "user", content = userPrompt }
         },
         max_tokens = 150, // Increased for more detailed personalized questions
-        temperature = 0.7
+        temperature = 0.85, // Slightly higher for more natural variation
+        presence_penalty = 0.3, // Encourage varied vocabulary
+        frequency_penalty = 0.2 // Reduce repetitive phrases
     };
 
     var jsonBody = JsonSerializer.Serialize(body);
