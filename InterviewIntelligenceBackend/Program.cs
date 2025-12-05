@@ -463,7 +463,7 @@ app.MapPost("/api/generate-question", async (GenerateQuestionRequest req, HttpCo
                 // Persist session changes to Cosmos DB
                 await SaveSessionToCosmosAsync(session);
                 
-                var thankYouMessage = $"Well, hey, that was great! Really enjoyed chatting with you and hearing about your experience. {(session.QuestionCount >= MaxQuestions ? "I think we covered everything I wanted to touch on" : "Looks like we're at time")}. The team will go through everything and get back to you soon. Before we wrap up though - any questions for me about the role or the team?";
+                var thankYouMessage = $"Well, hey, that was great! Really enjoyed chatting with you and hearing about your experience. {(session.QuestionCount >= MaxQuestions ? "I think we covered everything I wanted to touch on" : "Looks like we're at time")}. The team will go through everything and get back to you soon.Best Of Luck!";
                 
                 await http.Response.WriteAsJsonAsync(new GenerateQuestionResponse(thankYouMessage, true, session.QuestionCount, elapsedMinutes));
                 return;
